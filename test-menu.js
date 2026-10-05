@@ -4,11 +4,17 @@
 process.env.PORT = '0';
 process.chdir(require('node:fs').mkdtempSync(`${require('node:os').tmpdir()}/bottest-`));
 const assert = require('node:assert');
-const { menuMode, boasVindasText, menuText, pixMessage, pixPayload, cpfAleatorio, centavos } = require('./bot');
+const { menuMode, ehVideo, boasVindasText, menuText, pixMessage, pixPayload, cpfAleatorio, centavos } = require('./bot');
 
 assert.equal(menuMode(null, 'oi'), 'text');
 assert.equal(menuMode('https://x/i.png', 'a'.repeat(1024)), 'photo_caption');
 assert.equal(menuMode('https://x/i.png', 'a'.repeat(1025)), 'photo_then_text');
+// start_image também aceita vídeo: a extensão da URL decide foto x vídeo
+assert.equal(ehVideo('https://x/v.mp4'), true);
+assert.equal(ehVideo('https://x/v.MOV?token=1'), true);
+assert.equal(ehVideo('https://x/v.webm#t=2'), true);
+assert.equal(ehVideo('https://x/i.png'), false);
+assert.equal(ehVideo('https://x/mp4/i.jpg'), false); // extensão é o fim do caminho, não qualquer pedaço da URL
 // /start manda só as boas-vindas: os planos ficam para o botão "Acessar agora"
 assert.equal(boasVindasText({ name: 'x' }), 'Olá! Eu sou o bot x.');
 assert.equal(boasVindasText({ name: 'x', start_message: 'oi' }), 'oi');

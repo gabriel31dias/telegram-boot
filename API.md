@@ -10,13 +10,15 @@ Bot que cai volta sozinho: o polling é relançado com backoff de 5s, 10s, 20s�
 
 ## POST /bots — cadastrar ou atualizar bot
 
-Grava o bot + planos + order bumps e já sobe o bot. Campos: `name` e `token` obrigatórios, `start_message`, `start_image`, `gateway_token`, `gateway_document`, `plans` e `order_bumps` opcionais.
+Grava o bot + planos + order bumps e já sobe o bot. Campos: `name` e `token` obrigatórios, `start_message`, `start_image`, `gateway_token`, `gateway_document`, `cnpj`, `plans` e `order_bumps` opcionais.
+
+`cnpj` é o CPF (11) ou CNPJ (14 dígitos, só números) do dono do bot — não confundir com `gateway_document`, que é o documento usado na cobrança PIX. Serve para agrupar bots de uma mesma empresa/pessoa na listagem `GET /bots/cnpj/:cnpj`.
 
 **O token é a identidade do bot**: se já existir um bot com aquele token, a rota **atualiza** em vez de criar outro (responde `200` com o mesmo `id`; cadastro novo responde `201`). `plans` e `order_bumps` do body **substituem** os antigos — mande a lista completa, não só o que mudou. Bot já no ar pega a config nova na hora, sem restart (o token não mudou, a instância é a mesma).
 
 O `/start` é em dois passos: primeiro a mensagem de boas-vindas (`start_message` + `start_image`) com um botão **🚀 Acessar agora**; só ao clicar é que vem a lista de planos com um botão por plano. `/planos` pula direto para a lista.
 
-`start_image` é a URL (http/https) de uma imagem enviada com a mensagem de boas-vindas, acima do texto. Vai como foto com o texto na legenda; se o texto passar de 1024 caracteres (limite de legenda do Telegram), a foto vai sozinha e o texto/botão logo em seguida. URL fora do ar não derruba o menu — cai para só texto. Cada plano/bump precisa de `name` e `price`; o resto do objeto é salvo como está.
+`start_image` é a URL (http/https) de uma **imagem ou vídeo** enviado com a mensagem de boas-vindas, acima do texto. Quem decide é a extensão do arquivo: `.mp4`, `.mov`, `.m4v` e `.webm` vão como vídeo, qualquer outra como foto (query string depois da extensão não atrapalha: `.../v.mp4?token=1`). A mídia vai com o texto na legenda; se o texto passar de 1024 caracteres (limite de legenda do Telegram, igual para foto e vídeo), a mídia vai sozinha e o texto/botão logo em seguida. URL fora do ar não derruba o menu — cai para só texto. Cada plano/bump precisa de `name` e `price`; o resto do objeto é salvo como está.
 
 Os `order_bumps` são do bot (podem ser vários, máx. 31) e são oferecidos na ordem de cadastro — só nos planos com `order_bump.enabled: true`.
 
@@ -29,7 +31,7 @@ Os `order_bumps` são do bot (podem ser vários, máx. 31) e são oferecidos na 
   "audience": "new",
   "button_mode": "plans_discount",
   "messages": [
-    { "delay_minutes": 5,  "discount_percent": 5,  "text": "Ficou na dúvida? 5% off por tempo limitado." },
+    { "delay_minutes": 5,  "discount_percent": 5,  "text": "Ficou na dúvida? 5% off por tempo limitado.", "image": "https://exemplo.com/oferta.mp4" },
     { "delay_minutes": 60, "discount_percent": 10, "text": "🔥 Última chance! Desconto exclusivo só para você — escolha um plano abaixo." }
   ]
 }
@@ -37,20 +39,30 @@ Os `order_bumps` são do bot (podem ser vários, máx. 31) e são oferecidos na 
 
 | campo | o que é |
 |---|---|
-| `enabled` | o toggle "Downsell Ativo" (obrigatório, booleano) |
-| `trigger` | gatilho — `"start"` = no /start (1ª entrada) |
-| `audience` | destinatários — `"new"` = novos (nunca compraram) |
-| `button_mode` | modo dos botões — `"plans_discount"` = planos do bot com desconto |
+| `enabled` | o toggle "Downsell Ativo" (obrigatório, booleano). Ligado exige ao menos uma mensagem |
+| `trigger` | gatilho — `"start"` (no /start) ou `"abandoned_checkout"` (PIX gerado e não pago). Opcional, o padrão é `"start"` |
+| `audience` | destinatários — `"new"` (nunca compraram) ou `"all"` |
+| `button_mode` | modo dos botões — `"plans_discount"` (planos do bot com desconto) ou `"custom"` (só o texto) |
 | `messages[].delay_minutes` | quanto tempo depois do gatilho (obrigatório, ≥ 0) |
 | `messages[].discount_percent` | desconto da mensagem, 0 a 100 (opcional) |
 | `messages[].text` | texto, até 4096 caracteres (obrigatório) |
+| `messages[].image` | URL http(s) de imagem ou vídeo enviado junto com a mensagem (opcional) |
 
-Como funciona: no `/start` em chat privado, cada mensagem é enfileirada na tabela `scheduled_messages` com o horário de envio (`delay_minutes`). Um tick de 1 minuto varre a fila e envia o que venceu — **sempre pelo bot dono da linha (`bot_id`)**, nunca por outro: em chat privado o `chat_id` é o mesmo para todos os bots.
+Como funciona: quando o gatilho acontece em chat privado, cada mensagem é enfileirada na tabela `scheduled_messages` com o horário de envio (`delay_minutes` contado a partir do gatilho). Um tick de 1 minuto varre a fila e envia o que venceu — **sempre pelo bot dono da linha (`bot_id`)**, nunca por outro: em chat privado o `chat_id` é o mesmo para todos os bots.
+
+Os dois gatilhos:
+
+- `"start"` — dispara no `/start`. `/start` repetido não duplica (`UNIQUE(bot_id, chat_id, msg_index)`), então cada chat recebe a campanha uma vez só.
+- `"abandoned_checkout"` — dispara quando o PIX é gerado e entregue ao comprador, logo depois do QR Code. Pagou? `registrarCompra` cancela a fila e nada é enviado. Não pagou? As mensagens saem nos delays configurados. Cada novo checkout **reinicia a contagem** daquele chat (a fila anterior é apagada), então quem abandona duas vezes recebe a sequência de novo, a partir do último abandono.
+
+`messages[].image` segue a mesma regra do `start_image`: a extensão decide foto x vídeo (`.mp4`, `.mov`, `.m4v`, `.webm` = vídeo), o texto vai na legenda até 1024 caracteres e, acima disso, a mídia vai sozinha e o texto/botões logo depois. URL fora do ar não cancela a oferta — a mensagem sai em texto puro.
+
+O tempo real de envio é `delay_minutes` **+ até 1 minuto**, por causa do tick — `delay_minutes: 0` sai em até 1 minuto, não na hora.
 
 - Fila no banco, então o agendamento **sobrevive a restart** do processo.
-- `/start` repetido não duplica (`UNIQUE(bot_id, chat_id, msg_index)`).
+- `trigger`, `audience` e `button_mode` fora dos valores aceitos respondem `400`. Valor desconhecido não salva: campanha que o painel mostra ativa e o bot ignora é pior que erro na hora.
 - `audience: "new"` pula quem já tem compra registrada **naquele bot**; comprar em um bot não mexe no downsell dos outros.
-- Ao fechar o pedido, a compra é registrada em `purchases` e o downsell pendente daquele bot é cancelado.
+- Ao fechar o pedido, a compra é registrada em `purchases` e o downsell pendente daquele bot é cancelado (vale para os dois gatilhos).
 - `button_mode: "plans_discount"` manda os planos com o `discount_percent` aplicado. O desconto viaja no `callback_data` (`plan:<id>:<pct>`) e chega no resumo: `• plano ouro — R$ 134,91 (de R$ 149,90, -10%)`. Order bump entra pelo preço cheio.
 - Falha no envio (usuário bloqueou o bot) cancela aquela linha em vez de tentar para sempre.
 
@@ -94,7 +106,7 @@ curl -X POST http://localhost:3000/bots \
   -H 'Content-Type: application/json' \
   -d '{
     "name": "gabriel",
-    "token": "8801055027:AAGXpHlYLJ-xURO0Fwr3Mum2tL-CDFeehrM",
+    "token": "000000000:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
     "start_message": "Bem-vindo! Escolha seu plano 👇",
     "start_image": "https://exemplo.com/banner.jpg",
     "gateway_token": "Basic c2tfbGl2ZV8uLi46eA==",
@@ -146,6 +158,28 @@ Respostas: `201` com `{ id, name, start_message, plans, order_bumps }` · `400` 
 ```bash
 curl http://localhost:3000/bots
 ```
+
+## GET /bots/cnpj/:cnpj — listar bots de uma empresa/pessoa
+
+Retorna os bots cujo `cnpj` bate com o informado — CPF ou CNPJ, aceita com ou sem máscara, só os dígitos são comparados.
+
+```bash
+curl http://localhost:3000/bots/cnpj/12345678000199
+```
+
+## GET /bots/:id?cnpj=... — buscar um bot no formato do payload de criação
+
+Devolve o bot no **mesmo formato do body do `POST /bots`** (`name`, `token`, `start_message`, `start_image`, `gateway_token`, `gateway_document`, `cnpj`, `plans`, `order_bumps`, `downsell`), pronto para reenviar num novo `POST /bots` e atualizar o cadastro.
+
+Diferente do `publico()` usado em `GET /bots` e `GET /bots/cnpj/:cnpj`, aqui `token` e `gateway_token` vêm em texto puro (não tem `gateway_enabled`) — é um endpoint de edição, não de listagem pública.
+
+**`cnpj` é obrigatório na query string e precisa ser o mesmo cadastrado no bot** (CPF ou CNPJ, aceita com ou sem máscara). Sem ele, ou com o cnpj errado, a resposta é `404` — igual a um id que não existe, para não dar pra descobrir por tentativa que um id pertence a outra empresa/pessoa.
+
+```bash
+curl "http://localhost:3000/bots/1?cnpj=12345678000199"
+```
+
+Respostas: `200` com o bot · `400` id ou cnpj inválido · `404` bot não encontrado ou cnpj não bate.
 
 ## No Telegram
 

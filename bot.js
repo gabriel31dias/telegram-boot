@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const { Telegraf, Markup } = require('telegraf');
 const { DatabaseSync } = require('node:sqlite'); // ponytail: sqlite embutido do Node 22, sem dependência nova
@@ -64,6 +65,7 @@ try { db.exec('ALTER TABLE bots ADD COLUMN downsell TEXT'); } catch { /* já exi
 try { db.exec('ALTER TABLE bots ADD COLUMN start_image TEXT'); } catch { /* já existe */ }
 try { db.exec('ALTER TABLE bots ADD COLUMN gateway_token TEXT'); } catch { /* já existe */ }
 try { db.exec('ALTER TABLE bots ADD COLUMN gateway_document TEXT'); } catch { /* já existe */ }
+try { db.exec('ALTER TABLE bots ADD COLUMN cnpj TEXT'); } catch { /* já existe */ }
 
 const listPlans = (botId) =>
   db.prepare('SELECT id, data FROM plans WHERE bot_id = ?').all(botId)
@@ -103,10 +105,22 @@ const menuKeyboard = (plans, pct = 0) =>
     )])
   );
 
-// Imagem opcional acima das boas-vindas. Caption do Telegram vai só até 1024 chars:
-// passou disso, a foto vai sozinha e o texto/botões logo em seguida.
+// Imagem ou vídeo opcional acima das boas-vindas. Caption do Telegram vai só até 1024
+// chars (vale para foto e vídeo): passou disso, a mídia vai sozinha e o texto/botões
+// logo em seguida.
 const menuMode = (startImage, texto) =>
   !startImage ? 'text' : texto.length <= 1024 ? 'photo_caption' : 'photo_then_text';
+
+// start_image aceita vídeo: quem manda é a extensão da URL, o resto vai como foto.
+// Query string/hash depois da extensão não atrapalha (.../v.mp4?token=1).
+const ehVideo = (url) => /\.(mp4|mov|m4v|webm)(\?|#|$)/i.test(url);
+
+// Um envio só para os dois casos — o método muda, o resto das opções é igual.
+// Versão por chat_id: a fila do downsell não tem ctx, só a instância do bot.
+const enviarMidiaChat = (telegram, chatId, url, extra) =>
+  ehVideo(url) ? telegram.sendVideo(chatId, url, extra) : telegram.sendPhoto(chatId, url, extra);
+
+const enviarMidia = (ctx, url, extra) => enviarMidiaChat(ctx.telegram, ctx.chat.id, url, extra);
 
 // Oferta de um order bump: Adicionar / Recusar
 // ponytail: estado (plano + aceitos) vai no callback_data como bitmask — sem sessão em memória.
@@ -266,13 +280,24 @@ const agora = () => Math.floor(Date.now() / 1000);
 const jaComprou = (botId, chatId) =>
   !!db.prepare('SELECT 1 FROM purchases WHERE bot_id = ? AND chat_id = ?').get(botId, String(chatId));
 
+// Gatilhos implementados. Quem não manda o campo cai no 'start'.
+const GATILHOS = ['start', 'abandoned_checkout'];
+
 // Enfileira as mensagens do downsell para esse chat, cada uma no seu delay.
-// UNIQUE(bot_id, chat_id, msg_index) faz /start repetido não duplicar.
-function agendarDownsell(config, chatId) {
+// `gatilho` é o evento que acabou de acontecer: só agenda se bater com o do bot.
+// No 'start', UNIQUE(bot_id, chat_id, msg_index) faz /start repetido não duplicar.
+// No 'abandoned_checkout' a fila do chat é zerada antes: cada PIX não pago recomeça a
+// contagem, senão a linha do abandono anterior barraria o novo pelo mesmo UNIQUE.
+function agendarDownsell(config, chatId, gatilho = 'start') {
   const ds = config.downsell;
   if (!ds?.enabled || !Array.isArray(ds.messages) || !ds.messages.length) return 0;
-  if (ds.trigger && ds.trigger !== 'start') return 0;
+  if ((ds.trigger || 'start') !== gatilho) return 0;
   if (ds.audience === 'new' && jaComprou(config.id, chatId)) return 0;
+
+  if (gatilho === 'abandoned_checkout') {
+    db.prepare('DELETE FROM scheduled_messages WHERE bot_id = ? AND chat_id = ?')
+      .run(config.id, String(chatId));
+  }
 
   const ins = db.prepare(
     'INSERT OR IGNORE INTO scheduled_messages (bot_id, chat_id, msg_index, send_at) VALUES (?, ?, ?, ?)'
@@ -320,7 +345,19 @@ async function enviarPendentes() {
     const pct = msg.discount_percent || 0;
     const extra = ds.button_mode === 'plans_discount' ? menuKeyboard(listPlans(dono.id), pct) : undefined;
     try {
-      await dono.instance.telegram.sendMessage(row.chat_id, msg.text, extra);
+      // msg.image é opcional e aceita foto ou vídeo, igual ao start_image.
+      let naLegenda = menuMode(msg.image, msg.text) === 'photo_caption';
+      if (msg.image) {
+        try {
+          await enviarMidiaChat(dono.instance.telegram, row.chat_id, msg.image,
+            naLegenda ? { caption: msg.text, ...extra } : undefined);
+        } catch (err) {
+          // URL quebrada não engole a oferta: cai para texto puro, igual ao /start
+          console.error(`[${dono.name}] mídia do downsell falhou: ${err.message}`);
+          naLegenda = false;
+        }
+      }
+      if (!naLegenda) await dono.instance.telegram.sendMessage(row.chat_id, msg.text, extra);
       db.prepare('UPDATE scheduled_messages SET sent_at = ? WHERE id = ?').run(agora(), row.id);
       console.log(`[${dono.name}] downsell #${row.msg_index} enviado para ${row.chat_id}`);
     } catch (err) {
@@ -345,8 +382,8 @@ function startBot(row) {
     const modo = menuMode(config.start_image, texto);
     if (modo !== 'text') {
       try {
-        if (modo === 'photo_caption') return await ctx.replyWithPhoto(config.start_image, { caption: texto, ...teclado });
-        await ctx.replyWithPhoto(config.start_image);
+        if (modo === 'photo_caption') return await enviarMidia(ctx, config.start_image, { caption: texto, ...teclado });
+        await enviarMidia(ctx, config.start_image);
       } catch (err) {
         console.error(`[${config.name}] start_image falhou: ${err.message}`); // URL quebrada não engole o menu
       }
@@ -430,6 +467,10 @@ function startBot(row) {
     }
     if (!naLegenda) await ctx.reply(legenda, opcoes);
 
+    // Cobrança na mão e ainda não paga = checkout aberto. Se o pagamento cair,
+    // registrarCompra cancela a fila; se não cair, o downsell sai no delay configurado.
+    if (ctx.chat.type === 'private') agendarDownsell(config, ctx.chat.id, 'abandoned_checkout');
+
     // Confere sozinho por 1 min; se cair nesse tempo o comprador nem precisa clicar
     esperarPago(config.gateway_token, tx.id)
       .then((status) => status && confirmar(ctx, tx.id, status))
@@ -496,8 +537,28 @@ function startBot(row) {
     return confirmar(ctx, id, status, true);
   });
 
+  // ID do grupo VIP para colar no painel (passo "Grupo VIP" do wizard)
+  const idDoGrupo = (chatId) => ({
+    text: `🆔 ID deste grupo: <code>${chatId}</code>\n\nCopie e cole no painel, no passo "Grupo VIP".`,
+    extra: { parse_mode: 'HTML' },
+  });
+
   bot.command('groupid', async (ctx) => {
-    await ctx.reply(`Grupo: ${ctx.chat.id}`);
+    if (ctx.chat.type === 'private') {
+      return ctx.reply('Envie /groupid dentro do grupo privado (com o bot já adicionado como administrador).');
+    }
+    const { text, extra } = idDoGrupo(ctx.chat.id);
+    await ctx.reply(text, extra);
+  });
+
+  // Virou admin num grupo/canal: já manda o ID lá, sem precisar do /groupid.
+  // Canal não entrega comando como `message`, então este é o único caminho para canais.
+  bot.on('my_chat_member', async (ctx) => {
+    const { chat, old_chat_member: antes, new_chat_member: agora } = ctx.myChatMember;
+    if (chat.type === 'private' || agora.status !== 'administrator' || antes.status === 'administrator') return;
+    const { text, extra } = idDoGrupo(chat.id);
+    await ctx.telegram.sendMessage(chat.id, text, extra).catch((err) =>
+      console.error(`[${config.name}] não consegui mandar o ID no grupo ${chat.id}: ${err.message}`));
   });
 
   bot.command('info', async (ctx) => {
@@ -505,13 +566,6 @@ function startBot(row) {
   });
 
   bot.on('message', (ctx) => {
-    bot.command('groupid', async (ctx) => {
-      await ctx.reply(`Grupo: ${ctx.chat.id}`);
-    });
-  
-    bot.command('info', async (ctx) => {
-      await ctx.reply(`Eu sou o bot ${config.name}`);
-    });
     console.log(`[${config.name}] mensagem recebida`);
     console.log('Chat:', ctx.chat.id);
     console.log('User:', ctx.from.id);
@@ -555,7 +609,7 @@ function manterVivo(entry, tentativa = 1) {
 // alteração feita por fora (outro processo, direto no banco) entra sozinha:
 // bot novo sobe, e config de bot já no ar é atualizada — nada disso pede restart.
 function sincronizarBots() {
-  const rows = db.prepare('SELECT id, name, token, start_message, start_image, gateway_token, gateway_document, downsell FROM bots').all()
+  const rows = db.prepare('SELECT id, name, token, start_message, start_image, gateway_token, gateway_document, cnpj, downsell FROM bots').all()
     .map((r) => ({ ...r, downsell: r.downsell ? JSON.parse(r.downsell) : null }));
 
   let novos = 0;
@@ -603,10 +657,25 @@ app.use(express.json());
 function validarDownsell(d) {
   if (typeof d !== 'object' || Array.isArray(d)) return 'downsell deve ser um objeto.';
   if (typeof d.enabled !== 'boolean') return 'downsell.enabled deve ser true/false.';
+  // Sem isso um gatilho desconhecido salvava e nunca disparava — a campanha ficava viva na tela e morta no bot.
+  if (d.trigger !== undefined && !GATILHOS.includes(d.trigger)) {
+    return `downsell.trigger deve ser ${GATILHOS.join(' ou ')}.`;
+  }
+  if (d.audience !== undefined && !['new', 'all'].includes(d.audience)) {
+    return 'downsell.audience deve ser new ou all.';
+  }
+  if (d.button_mode !== undefined && !['plans_discount', 'custom'].includes(d.button_mode)) {
+    return 'downsell.button_mode deve ser plans_discount ou custom.';
+  }
   if (!Array.isArray(d.messages)) return 'downsell.messages deve ser um array.';
+  // Ligado e vazio é o pior estado possível: o painel mostra a campanha ativa e o bot nunca envia nada.
+  if (d.enabled && !d.messages.length) return 'downsell ligado precisa de pelo menos uma mensagem.';
   for (const m of d.messages) {
     if (!m || typeof m.text !== 'string' || !m.text.trim()) return 'cada mensagem do downsell precisa de text.';
     if (m.text.length > 4096) return 'mensagem do downsell passa de 4096 caracteres.'; // limite do Telegram
+    if (m.image !== undefined && m.image !== null && m.image !== '' && !/^https?:\/\/\S+$/.test(m.image)) {
+      return 'image da mensagem do downsell deve ser uma URL http(s) de imagem ou vídeo.';
+    }
     if (typeof m.delay_minutes !== 'number' || m.delay_minutes < 0) return 'delay_minutes deve ser número >= 0.';
     if (m.discount_percent !== undefined &&
         (typeof m.discount_percent !== 'number' || m.discount_percent < 0 || m.discount_percent > 100)) {
@@ -617,8 +686,8 @@ function validarDownsell(d) {
 }
 
 // Resposta pública do bot: gateway_token é segredo e nunca sai daqui
-const publico = ({ id, name, start_message, start_image, gateway_token, gateway_document, downsell }) => ({
-  id, name, start_message, start_image, gateway_document, gateway_enabled: !!gateway_token,
+const publico = ({ id, name, start_message, start_image, gateway_token, gateway_document, cnpj, downsell }) => ({
+  id, name, start_message, start_image, gateway_document, cnpj, gateway_enabled: !!gateway_token,
   downsell, plans: listPlans(id), order_bumps: listBumps(id),
 });
 
@@ -627,7 +696,7 @@ const publico = ({ id, name, start_message, start_image, gateway_token, gateway_
 app.post('/bots', (req, res) => {
   const {
     name, token, start_message = null, start_image = null,
-    gateway_token = null, gateway_document = null,
+    gateway_token = null, gateway_document = null, cnpj = null,
     plans = [], order_bumps = [], downsell = null,
   } = req.body || {};
 
@@ -642,13 +711,16 @@ app.post('/bots', (req, res) => {
     return res.status(400).json({ error: 'start_message deve ser texto.' });
   }
   if (start_image !== null && !/^https?:\/\/\S+$/.test(start_image)) {
-    return res.status(400).json({ error: 'start_image deve ser uma URL http(s).' });
+    return res.status(400).json({ error: 'start_image deve ser uma URL http(s) de imagem ou vídeo.' });
   }
   if (gateway_token !== null && (typeof gateway_token !== 'string' || !gateway_token.trim())) {
     return res.status(400).json({ error: 'gateway_token deve ser o header authorization do gateway (ex: "Basic c2tf...").' });
   }
   if (gateway_document !== null && !/^\d{11}$|^\d{14}$/.test(gateway_document)) {
     return res.status(400).json({ error: 'gateway_document deve ser CPF (11) ou CNPJ (14 dígitos), só números.' });
+  }
+  if (cnpj !== null && !/^\d{11}$|^\d{14}$/.test(cnpj)) {
+    return res.status(400).json({ error: 'cnpj deve ser CPF (11) ou CNPJ (14 dígitos), só números.' });
   }
   if (!Array.isArray(plans) || !Array.isArray(order_bumps)) {
     return res.status(400).json({ error: 'plans e order_bumps devem ser arrays.' });
@@ -684,19 +756,19 @@ app.post('/bots', (req, res) => {
       // ponytail: plans/bumps do body substituem os antigos (deleta e regrava). Sem merge por id —
       // mande a lista completa. `purchases` guarda o plan_id antigo, que pode não existir mais.
       db.prepare(`UPDATE bots SET name = ?, start_message = ?, start_image = ?,
-                  gateway_token = ?, gateway_document = ?, downsell = ? WHERE id = ?`)
-        .run(name.trim(), start_message, start_image, gateway_token, gateway_document,
+                  gateway_token = ?, gateway_document = ?, cnpj = ?, downsell = ? WHERE id = ?`)
+        .run(name.trim(), start_message, start_image, gateway_token, gateway_document, cnpj,
              downsell && JSON.stringify(downsell), existente.id);
       db.prepare('DELETE FROM plans WHERE bot_id = ?').run(existente.id);
       db.prepare('DELETE FROM order_bumps WHERE bot_id = ?').run(existente.id);
     }
     const id = existente
       ? existente.id
-      : Number(db.prepare(`INSERT INTO bots (name, token, start_message, start_image, gateway_token, gateway_document, downsell)
-                           VALUES (?, ?, ?, ?, ?, ?, ?)`)
-          .run(name.trim(), token.trim(), start_message, start_image, gateway_token, gateway_document,
+      : Number(db.prepare(`INSERT INTO bots (name, token, start_message, start_image, gateway_token, gateway_document, cnpj, downsell)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+          .run(name.trim(), token.trim(), start_message, start_image, gateway_token, gateway_document, cnpj,
                downsell && JSON.stringify(downsell)).lastInsertRowid);
-    row = { id, name: name.trim(), token: token.trim(), start_message, start_image, gateway_token, gateway_document, downsell };
+    row = { id, name: name.trim(), token: token.trim(), start_message, start_image, gateway_token, gateway_document, cnpj, downsell };
 
     const insertPlan = db.prepare('INSERT INTO plans (bot_id, name, price, data) VALUES (?, ?, ?, ?)');
     for (const p of plans) insertPlan.run(row.id, p.name.trim(), p.price, JSON.stringify(p));
@@ -719,12 +791,57 @@ app.post('/bots', (req, res) => {
 
 app.get('/bots', (req, res) => res.json(bots.map(publico)));
 
+// GET /bots/cnpj/:cnpj — bots de uma mesma empresa/pessoa (dígitos do cpf/cnpj, com ou sem máscara)
+app.get('/bots/cnpj/:cnpj', (req, res) => {
+  const cnpj = req.params.cnpj.replace(/\D/g, '');
+  if (!/^\d{11}$|^\d{14}$/.test(cnpj)) {
+    return res.status(400).json({ error: 'cnpj deve ser CPF (11) ou CNPJ (14 dígitos).' });
+  }
+  res.json(bots.filter((b) => b.cnpj === cnpj).map(publico));
+});
+
+// GET /bots/:id?cnpj=... — bot no mesmo formato do payload do POST /bots (com token e
+// gateway_token em claro, diferente de `publico()`), pronto pra reenviar num PUT/edição.
+// `cnpj` é obrigatório e precisa bater com o dono do bot — sem ele (ou errado), nem confirma
+// que o id existe: sempre 404, pra não vazar id de bot de outra empresa/pessoa por enumeração.
+app.get('/bots/:id', (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'id deve ser um número inteiro.' });
+
+  const cnpj = String(req.query.cnpj || '').replace(/\D/g, '');
+  if (!/^\d{11}$|^\d{14}$/.test(cnpj)) {
+    return res.status(400).json({ error: 'cnpj deve ser CPF (11) ou CNPJ (14 dígitos), passado por query (?cnpj=...).' });
+  }
+
+  const row = db.prepare('SELECT * FROM bots WHERE id = ?').get(id);
+  if (!row || row.cnpj !== cnpj) return res.status(404).json({ error: 'bot não encontrado.' });
+
+  res.json({
+    id: row.id,
+    name: row.name,
+    token: row.token,
+    start_message: row.start_message,
+    start_image: row.start_image,
+    gateway_token: row.gateway_token,
+    gateway_document: row.gateway_document,
+    cnpj: row.cnpj,
+    downsell: row.downsell ? JSON.parse(row.downsell) : null,
+    plans: listPlans(id),
+    order_bumps: listBumps(id),
+  });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Servidor rodando na porta ${PORT}`));
 
 // ponytail: try/catch porque bot que falhou no launch não está rodando
-const stop = (sig) => bots.forEach((b) => { b.parando = true; try { b.instance.stop(sig); } catch {} });
+// Depois de parar os bots, sai: o servidor HTTP segurava o processo vivo e o SIGTERM
+// (pm2, test-upsert) deixava um bot.js órfão rodando para sempre.
+const stop = (sig) => {
+  bots.forEach((b) => { b.parando = true; try { b.instance.stop(sig); } catch {} });
+  process.exit(0);
+};
 process.once('SIGINT', () => stop('SIGINT'));
 process.once('SIGTERM', () => stop('SIGTERM'));
 
-module.exports = { db, bots, startBot, trocarToken, menuMode, boasVindasText, pixMessage, pixPayload, cpfAleatorio, gatewayFetch, consultarStatus, esperarPago, centavos, valorPix, PAGO, manterVivo, sincronizarBots, validarDownsell, agendarDownsell, cancelarDownsell, registrarCompra, enviarPendentes, comDesconto, menuText, menuKeyboard, bumpPrompt, summaryText, vipLinks, listPlans, listBumps };
+module.exports = { db, bots, startBot, trocarToken, menuMode, ehVideo, enviarMidiaChat, boasVindasText, pixMessage, pixPayload, cpfAleatorio, gatewayFetch, consultarStatus, esperarPago, centavos, valorPix, PAGO, manterVivo, sincronizarBots, validarDownsell, agendarDownsell, cancelarDownsell, registrarCompra, enviarPendentes, comDesconto, menuText, menuKeyboard, bumpPrompt, summaryText, vipLinks, listPlans, listBumps };
